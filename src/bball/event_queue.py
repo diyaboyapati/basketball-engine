@@ -73,8 +73,9 @@ class ReorderBuffer:
     """Holds events until the watermark proves nothing earlier can arrive.
 
     A live feed is roughly ordered but not exactly. We cannot sort a stream
-    that has not finished arriving, so we hold events for `lateness` seconds
-    of game time and release them in key order once they age out.
+    that has not finished arriving, so we hold events until we have seen
+    something `lateness` seconds later, then release them in key order.
+    The watermark asserts: nothing strictly before this second will arrive.
     """
 
     def __init__(self, lateness: int = 5, strict: bool = False) -> None:
@@ -84,7 +85,7 @@ class ReorderBuffer:
         self.strict = strict
         self._heap = MinHeap()
         self._max_seen = -1  # highest elapsed observed on input
-        self._watermark = -1  # everything at or below this is released
+        self._watermark = -1  # everything strictly before this is released
         self.dropped: list[Event] = []
 
     def __len__(self) -> int:
@@ -96,7 +97,7 @@ class ReorderBuffer:
 
     def push(self, event: Event) -> list[Event]:
         """Ingest one event, return whatever became releasable."""
-        if event.elapsed <= self._watermark:
+        if event.elapsed < self._watermark:
             # too late, its slot in the output order already passed
             if self.strict:
                 raise LateEventError(
@@ -117,7 +118,7 @@ class ReorderBuffer:
 
     def _drain_ready(self) -> list[Event]:
         out: list[Event] = []
-        while self._heap and self._heap.peek().elapsed <= self._watermark:
+        while self._heap and self._heap.peek().elapsed < self._watermark:
             out.append(self._heap.pop())
         return out
 
@@ -127,7 +128,7 @@ class ReorderBuffer:
         while self._heap:
             out.append(self._heap.pop())
         if out:
-            self._watermark = out[-1].elapsed
+            self._watermark = out[-1].elapsed + 1
         return out
 
 
