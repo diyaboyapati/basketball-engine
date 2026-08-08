@@ -227,3 +227,307 @@ def test_lateness_zero_still_orders_ties_at_same_second():
     events = [make_event(1, 600, 2), make_event(1, 600, 1), make_event(1, 600, 0)]
     result = ordered(events, lateness=0)
     assert [e.seq for e in result] == [0, 1, 2]
+
+from bball.fenwick import DualFenwick, Fenwick
+from bball.segment_tree import IDENTITY, MaxSubarrayTree, RunTree
+
+
+# ---------- brute-force ways ----------
+
+
+def brute_range_sum(values: list[int], start: int, end: int) -> int:
+    return sum(values[start:end])
+
+
+def brute_max_subarray(values: list[int], start: int, end: int):
+    """Kadane over a slice. Returns (best, start, end_inclusive)."""
+    window = values[start:end]
+    if not window:
+        return None
+    best = window[0]
+    best_lo = best_hi = start
+    cur = window[0]
+    cur_lo = start
+    for i in range(1, len(window)):
+        idx = start + i
+        if cur + window[i] >= window[i]:
+            cur += window[i]
+        else:
+            cur = window[i]
+            cur_lo = idx
+        if cur > best:
+            best, best_lo, best_hi = cur, cur_lo, idx
+    return best, best_lo, best_hi
+
+
+# ---------- Fenwick ----------
+
+
+def test_fenwick_empty_reads_zero():
+    f = Fenwick(10)
+    assert f.total == 0
+    assert f.prefix(10) == 0
+    assert f.range_sum(3, 7) == 0
+    assert f.to_list() == [0] * 10
+
+
+def test_fenwick_single_point():
+    f = Fenwick(8)
+    f.add(3, 5)
+    assert f.at(3) == 5
+    assert f.prefix(3) == 0
+    assert f.prefix(4) == 5
+    assert f.range_sum(3, 4) == 5
+    assert f.range_sum(0, 3) == 0
+    assert f.total == 5
+
+
+def test_fenwick_matches_list_model():
+    rng = random.Random(101)
+    n = 200
+    f = Fenwick(n)
+    model = [0] * n
+
+    for _ in range(1000):
+        i = rng.randrange(n)
+        d = rng.randint(-5, 5)
+        f.add(i, d)
+        model[i] += d
+
+        start = rng.randrange(n)
+        end = rng.randint(start, n)
+        assert f.range_sum(start, end) == brute_range_sum(model, start, end)
+
+    assert f.to_list() == model
+    assert f.total == sum(model)
+
+
+def test_fenwick_prefix_covers_all_boundaries():
+    rng = random.Random(103)
+    n = 64
+    f = Fenwick(n)
+    model = [rng.randint(0, 3) for _ in range(n)]
+    for i, v in enumerate(model):
+        f.add(i, v)
+
+    for end in range(n + 1):
+        assert f.prefix(end) == sum(model[:end])
+
+
+def test_fenwick_empty_and_reversed_ranges():
+    f = Fenwick(10)
+    f.add(5, 7)
+    assert f.range_sum(5, 5) == 0
+    assert f.range_sum(8, 3) == 0
+    assert f.prefix(0) == 0
+
+
+def test_fenwick_rejects_out_of_range():
+    f = Fenwick(10)
+    with pytest.raises(IndexError):
+        f.add(10, 1)
+    with pytest.raises(IndexError):
+        f.add(-1, 1)
+    with pytest.raises(IndexError):
+        f.prefix(11)
+
+
+# ---------- DualFenwick ----------
+
+
+def test_dual_fenwick_keeps_teams_separate():
+    d = DualFenwick(2880)
+    d.add("HOME", 100, 3)
+    d.add("AWAY", 100, 2)
+    d.add("HOME", 500, 2)
+
+    assert d.score() == {"HOME": 5, "AWAY": 2}
+    assert d.window(0, 200) == {"HOME": 3, "AWAY": 2}
+    assert d.window(200, 2880) == {"HOME": 2, "AWAY": 0}
+
+
+def test_dual_fenwick_margin_sign():
+    d = DualFenwick(2880)
+    d.add("AWAY", 50, 6)
+    d.add("HOME", 60, 2)
+    assert d.margin() == -4
+    assert d.margin(55, 2880) == 2
+
+
+def test_dual_fenwick_unknown_team():
+    d = DualFenwick(100)
+    with pytest.raises(KeyError):
+        d.add("NOBODY", 0, 2)
+
+
+# ---------- MaxSubarrayTree ----------
+
+
+def test_segment_tree_matches_kadane():
+    rng = random.Random(201)
+    n = 120
+    tree = MaxSubarrayTree(n)
+    model = [0] * n
+
+    for _ in range(400):
+        i = rng.randrange(n)
+        d = rng.randint(-4, 4)
+        tree.add(i, d)
+        model[i] += d
+
+        start = rng.randrange(n)
+        end = rng.randint(start + 1, n)
+        node = tree.query(start, end)
+        expected = brute_max_subarray(model, start, end)
+        assert node.best == expected[0]
+        assert sum(model[node.best_start : node.best_end + 1]) == node.best
+
+
+def test_segment_tree_all_negative_picks_least_bad():
+    tree = MaxSubarrayTree(5)
+    for i, v in enumerate([-3, -1, -4, -2, -5]):
+        tree.set(i, v)
+    node = tree.query(0, 5)
+    assert node.best == -1
+    assert node.best_start == node.best_end == 1
+
+
+def test_segment_tree_all_positive_takes_whole_range():
+    tree = MaxSubarrayTree(6)
+    for i in range(6):
+        tree.set(i, 2)
+    node = tree.query(0, 6)
+    assert node.best == 12
+    assert node.best_start == 0
+    assert node.best_end == 5
+
+
+def test_segment_tree_finds_straddling_run():
+    # the answer crosses the midpoint, which prefix subtraction cannot recover
+    values = [5, -1, -1, 4, 4, -1, -1, 5]
+    tree = MaxSubarrayTree(len(values))
+    for i, v in enumerate(values):
+        tree.set(i, v)
+
+    node = tree.query(2, 6)
+    assert node.best == 8
+    assert node.best_start == 3
+    assert node.best_end == 4
+
+
+def test_segment_tree_prefix_subtraction_would_be_wrong():
+    values = [9, -9, 4, 4, -9, 9]
+    tree = MaxSubarrayTree(len(values))
+    for i, v in enumerate(values):
+        tree.set(i, v)
+
+    whole = tree.query(0, 6).best
+    left = tree.query(0, 2).best
+    inner = tree.query(2, 4).best
+    assert inner == 8
+    assert whole - left != inner  # no inverse, so subtraction is meaningless
+
+
+def test_segment_tree_total_matches_sum():
+    rng = random.Random(203)
+    n = 50
+    tree = MaxSubarrayTree(n)
+    model = [rng.randint(-5, 5) for _ in range(n)]
+    for i, v in enumerate(model):
+        tree.set(i, v)
+
+    for _ in range(100):
+        start = rng.randrange(n)
+        end = rng.randint(start + 1, n)
+        assert tree.query(start, end).total == sum(model[start:end])
+
+
+def test_segment_tree_single_element_ranges():
+    tree = MaxSubarrayTree(10)
+    tree.set(4, 7)
+    node = tree.query(4, 5)
+    assert node.best == node.total == 7
+    assert node.best_start == node.best_end == 4
+
+
+def test_segment_tree_empty_range_is_identity():
+    tree = MaxSubarrayTree(10)
+    assert tree.query(3, 3) is IDENTITY
+
+
+def test_segment_tree_rejects_out_of_range():
+    tree = MaxSubarrayTree(10)
+    with pytest.raises(IndexError):
+        tree.add(10, 1)
+    with pytest.raises(IndexError):
+        tree.query(0, 11)
+
+
+# ---------- RunTree ----------
+
+
+def test_run_tree_finds_scoring_run():
+    rt = RunTree(2880)
+    for sec in (100, 120, 140, 160):
+        rt.add("HOME", sec, 3)
+
+    run = rt.best_run("HOME")
+    assert run.points == 12
+    assert run.start == 100
+    assert run.end == 161
+    assert run.seconds == 61
+
+
+def test_run_tree_opponent_scoring_breaks_the_run():
+    rt = RunTree(2880)
+    rt.add("HOME", 10, 5)
+    rt.add("AWAY", 20, 20)
+    rt.add("HOME", 30, 6)
+
+    assert rt.best_run("HOME").points == 6
+    assert rt.best_run("HOME").start == 30
+    assert rt.best_run("AWAY").points == 20
+
+
+def test_run_tree_negation_is_symmetric():
+    rng = random.Random(207)
+    rt = RunTree(600)
+    for _ in range(80):
+        team = rng.choice(["HOME", "AWAY"])
+        rt.add(team, rng.randrange(600), rng.choice([1, 2, 3]))
+
+    for start, end in [(0, 600), (100, 400), (250, 260)]:
+        h = rt.best_run("HOME", start, end)
+        a = rt.best_run("AWAY", start, end)
+        assert h.points >= 0 and a.points >= 0
+        # both teams cannot own a net run over the same exact window
+        assert not (h.points > 0 and a.points > 0 and h.start == a.start and h.end == a.end)
+
+
+def test_run_tree_no_run_returns_zero():
+    rt = RunTree(600)
+    rt.add("AWAY", 50, 10)
+    run = rt.best_run("HOME")
+    assert run.points == 0
+    assert run.seconds == 0
+
+
+def test_run_tree_window_restricts_the_answer():
+    rt = RunTree(2880)
+    for sec in (100, 110, 120):
+        rt.add("HOME", sec, 3)
+    for sec in (2000, 2010):
+        rt.add("HOME", sec, 2)
+
+    assert rt.best_run("HOME", 0, 2880).points == 13
+    assert rt.best_run("HOME", 1500, 2880).points == 4
+    assert rt.best_run("HOME", 1500, 2880).start == 2000
+
+
+def test_run_tree_overall_picks_bigger_side():
+    rt = RunTree(2880)
+    rt.add("HOME", 100, 4)
+    rt.add("AWAY", 500, 9)
+    best = rt.best_run_overall()
+    assert best.team == "AWAY"
+    assert best.points == 9
