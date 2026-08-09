@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .events import Event, EventType
 
@@ -114,7 +114,12 @@ class Streak:
     end: int = 0
 
     def as_dict(self) -> dict:
-        return {"team": self.team, "points": self.points, "start": self.start, "end": self.end}
+        return {
+            "team": self.team,
+            "points": self.points,
+            "start": self.start,
+            "end": self.end,
+        }
 
 
 class GameState:
@@ -131,6 +136,7 @@ class GameState:
         self.streak = Streak()
         self.best_streak = Streak()
         self._last_margin = 0
+        self._last_leader: str | None = None
 
     # ---------- lookups ----------
 
@@ -146,7 +152,10 @@ class GameState:
 
     @property
     def score(self) -> dict[str, int]:
-        return {self.home: self.teams[self.home].points, self.away: self.teams[self.away].points}
+        return {
+            self.home: self.teams[self.home].points,
+            self.away: self.teams[self.away].points,
+        }
 
     @property
     def margin(self) -> int:
@@ -233,7 +242,7 @@ class GameState:
         self._update_streak(event)
         self._update_lead()
 
-   def _update_streak(self, event: Event) -> None:
+    def _update_streak(self, event: Event) -> None:
         if self.streak.team != event.team:
             self.streak = Streak(team=event.team, points=0, start=event.elapsed)
         self.streak.points += event.points
@@ -249,17 +258,26 @@ class GameState:
     def _update_lead(self) -> None:
         margin = self.margin
         if margin > 0:
-            self.teams[self.home].largest_lead = max(self.teams[self.home].largest_lead, margin)
+            self.teams[self.home].largest_lead = max(
+                self.teams[self.home].largest_lead, margin
+            )
         elif margin < 0:
-            self.teams[self.away].largest_lead = max(self.teams[self.away].largest_lead, -margin)
+            self.teams[self.away].largest_lead = max(
+                self.teams[self.away].largest_lead, -margin
+            )
 
-        # sign change means the lead flipped, zero is just a tie
         if margin == 0 and self._last_margin != 0:
             for t in self.teams.values():
                 t.ties += 1
-        elif margin * self._last_margin < 0:
-            for t in self.teams.values():
-                t.lead_changes += 1
+
+        # compare against whoever led last, so a tie in between still counts
+        if margin != 0:
+            leader = self.home if margin > 0 else self.away
+            if self._last_leader is not None and leader != self._last_leader:
+                for t in self.teams.values():
+                    t.lead_changes += 1
+            self._last_leader = leader
+
         self._last_margin = margin
 
     # ---------- output ----------
@@ -268,7 +286,10 @@ class GameState:
         return {
             "score": self.score,
             "period": self.period,
-            "teams": [self.teams[self.home].as_dict(), self.teams[self.away].as_dict()],
+            "teams": [
+                self.teams[self.home].as_dict(),
+                self.teams[self.away].as_dict(),
+            ],
             "players": [p.as_dict() for p in self.top_scorers(limit=len(self.players))],
             "lead_changes": self.teams[self.home].lead_changes,
             "ties": self.teams[self.home].ties,
