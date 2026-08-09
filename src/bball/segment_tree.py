@@ -26,8 +26,15 @@ def leaf(value: int, index: int) -> Node:
     return Node(value, value, index, value, index, value, index, index)
 
 
+def _better(sum_a: int, start_a: int, end_a: int, sum_b: int, start_b: int, end_b: int) -> bool:
+    """Bigger sum wins. Equal sums go to the shorter window."""
+    if sum_a != sum_b:
+        return sum_a > sum_b
+    return (end_a - start_a) < (end_b - start_b)
+
+
 def merge(a: Node, b: Node) -> Node:
-    """Combine adjacent ranges. Ties prefer the leftmost window."""
+    """Combine adjacent ranges."""
     if a is IDENTITY:
         return b
     if b is IDENTITY:
@@ -36,23 +43,27 @@ def merge(a: Node, b: Node) -> Node:
     total = a.total + b.total
 
     # best prefix either stops inside a, or swallows a and continues into b
-    if a.pref >= a.total + b.pref:
+    # both start at the same edge, so only the end differs
+    extended_pref = a.total + b.pref
+    if _better(a.pref, 0, a.pref_end, extended_pref, 0, b.pref_end):
         pref, pref_end = a.pref, a.pref_end
     else:
-        pref, pref_end = a.total + b.pref, b.pref_end
+        pref, pref_end = extended_pref, b.pref_end
 
     # best suffix either starts inside b, or swallows b and reaches back into a
-    if b.suf > b.total + a.suf:
+    # both end at the same edge, so only the start differs
+    extended_suf = b.total + a.suf
+    if _better(b.suf, b.suf_start, 0, extended_suf, a.suf_start, 0):
         suf, suf_start = b.suf, b.suf_start
     else:
-        suf, suf_start = b.total + a.suf, a.suf_start
+        suf, suf_start = extended_suf, a.suf_start
 
     # best is left-only, right-only, or straddling the seam
     best, best_start, best_end = a.best, a.best_start, a.best_end
     cross = a.suf + b.pref
-    if cross > best:
+    if _better(cross, a.suf_start, b.pref_end, best, best_start, best_end):
         best, best_start, best_end = cross, a.suf_start, b.pref_end
-    if b.best > best:
+    if _better(b.best, b.best_start, b.best_end, best, best_start, best_end):
         best, best_start, best_end = b.best, b.best_start, b.best_end
 
     return Node(total, pref, pref_end, suf, suf_start, best, best_start, best_end)
