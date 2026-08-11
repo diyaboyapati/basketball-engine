@@ -110,7 +110,7 @@ def cmd_replay(args) -> int:
 
     if commentator and commentator.lines:
         print("  COMMENTARY")
-        for line in commentator.lines:
+        for line in commentator.transcript():
             print(f"  - {line}")
         print()
     return 0
