@@ -4,14 +4,26 @@ import itertools
 
 import pytest
 
+from bball.agent import (
+    Commentator,
+    check_noteworthy,
+    clock_label,
+    get_best_run,
+    get_player_stats,
+    get_score,
+    run_tool,
+    win_probability,
+)
+from bball.cli import main as cli_main
+from bball.engine import Engine
 from bball.events import Event, EventType
 from bball.game_state import GameState
 from bball.possession_fsm import (
     TRANSITIONS,
-    Effect,
     IllegalTransitionError,
     PossessionFSM,
 )
+from bball.synthetic import generate
 
 _seq = itertools.count()
 
@@ -30,6 +42,22 @@ def ev(elapsed: int, etype: EventType, team: str | None = None, player: str | No
 
 def tipoff(fsm: PossessionFSM, team: str = "HOME", at: int = 0) -> None:
     fsm.apply(ev(at, EventType.JUMP_BALL, team))
+
+
+def run_game(seed: int = 0, **kwargs) -> Engine:
+    engine = Engine(home=kwargs.pop("home", "HOME"), away=kwargs.pop("away", "AWAY"))
+    engine.process_all(generate(seed=seed, **kwargs))
+    engine.finish()
+    return engine
+
+
+def watched_game(seed: int, **kwargs) -> tuple[Engine, Commentator]:
+    engine = Engine()
+    commentator = Commentator(engine)
+    engine.on_update(commentator.observe)
+    engine.process_all(generate(seed=seed, **kwargs))
+    engine.finish()
+    return engine, commentator
 
 
 # ---------- FSM: the transition table ----------
@@ -419,3 +447,365 @@ def test_period_markers_advance_the_clock_only():
     assert gs.score == {"HOME": 0, "AWAY": 0}
     assert gs.events_seen == 2
     assert gs.elapsed == 719
+
+
+# ---------- synthetic generator ----------
+
+
+def test_same_seed_gives_identical_events():
+    a = generate(seed=42)
+    b = generate(seed=42)
+    assert [e.key for e in a] == [e.key for e in b]
+    assert [e.type for e in a] == [e.type for e in b]
+    assert [e.player for e in a] == [e.player for e in b]
+
+
+def test_different_seeds_give_different_games():
+    a = generate(seed=1)
+    b = generate(seed=2)
+    assert [(e.type, e.player) for e in a] != [(e.type, e.player) for e in b]
+
+
+def test_generated_events_are_chronological():
+    events = generate(seed=5)
+    assert [e.key for e in events] == sorted(e.key for e in events)
+
+
+def test_generated_game_covers_four_periods():
+    events = generate(seed=6)
+    assert {e.period for e in events} == {1, 2, 3, 4}
+    assert events[0].type is EventType.PERIOD_START
+    assert events[-1].type is EventType.PERIOD_END
+
+
+def test_every_period_opens_with_a_possession():
+    events = generate(seed=71)
+    openers = [e for e in events if e.type is EventType.JUMP_BALL]
+    assert len(openers) == 4
+    assert {e.period for e in openers} == {1, 2, 3, 4}
+    assert all(e.team is not None for e in openers)
+
+
+def test_every_field_goal_miss_is_rebounded():
+    events = generate(seed=8)
+    misses = {EventType.MISS_2, EventType.MISS_3}
+    rebounds = {EventType.OFF_REBOUND, EventType.DEF_REBOUND}
+    for i, e in enumerate(events):
+        if e.type in misses:
+            nxt = [x.type for x in events[i + 1 : i + 3]]
+            assert any(t in rebounds for t in nxt)
+
+
+def test_every_rebound_follows_a_miss():
+    events = generate(seed=8)
+    misses = {EventType.MISS_2, EventType.MISS_3, EventType.MISS_FT}
+    rebounds = {EventType.OFF_REBOUND, EventType.DEF_REBOUND}
+    for i, e in enumerate(events):
+        if e.type in rebounds:
+            prev = [x.type for x in events[max(0, i - 2) : i]]
+            assert any(t in misses for t in prev)
+
+
+def test_assist_precedes_the_basket_it_fed():
+    events = generate(seed=9)
+    for a, b in zip(events, events[1:]):
+        if a.type is EventType.ASSIST:
+            assert b.type in (EventType.MADE_2, EventType.MADE_3)
+            assert a.team == b.team
+            assert a.elapsed == b.elapsed
+            assert a.seq < b.seq  # same second, ordering comes from seq
+
+
+def test_jitter_scrambles_but_keeps_the_same_events():
+    clean = generate(seed=11)
+    messy = generate(seed=11, jitter=6)
+    assert [e.key for e in messy] != [e.key for e in clean]
+    assert sorted(e.key for e in messy) == sorted(e.key for e in clean)
+
+
+def test_home_edge_shifts_scoring():
+    plain = sum(run_game(seed=s).margin() for s in range(4))
+    tilted = sum(run_game(seed=s, home_edge=25).margin() for s in range(4))
+    assert tilted > plain
+
+
+# ---------- engine wiring ----------
+
+
+def test_engine_replay_is_deterministic():
+    a = run_game(seed=21)
+    b = run_game(seed=21)
+    assert a.box_score() == b.box_score()
+    assert [e.key for e in a.log] == [e.key for e in b.log]
+
+
+def test_engine_recovers_the_same_game_from_a_jittered_feed():
+    clean = Engine()
+    clean.process_all(generate(seed=23))
+    clean.finish()
+
+    # lateness must exceed the feed's actual disorder or events age out
+    messy = Engine(lateness=300)
+    messy.process_all(generate(seed=23, jitter=6))
+    messy.finish()
+
+    assert messy.buffer.dropped == []
+    assert messy.score == clean.score
+    assert messy.box_score()["players"] == clean.box_score()["players"]
+    assert [e.key for e in messy.log] == [e.key for e in clean.log]
+
+
+def test_too_small_a_lateness_drops_events():
+    engine = Engine(lateness=5)
+    engine.process_all(generate(seed=23, jitter=6))
+    engine.finish()
+    assert engine.buffer.dropped  # the tolerance is a real tradeoff, not free
+
+
+def test_engine_processes_every_event():
+    events = generate(seed=25)
+    engine = Engine()
+    engine.process_all(events)
+    engine.finish()
+    assert len(engine.log) == len(events)
+    assert [e.key for e in engine.log] == sorted(e.key for e in events)
+
+
+def test_synthetic_game_produces_no_fsm_violations():
+    engine = run_game(seed=27)
+    assert engine.fsm.violations == []
+
+
+def test_fenwick_total_matches_game_state_score():
+    engine = run_game(seed=29)
+    assert engine.points.score() == engine.state.score
+
+
+def test_window_score_over_whole_game_equals_final():
+    engine = run_game(seed=31)
+    whole = engine.window_score(0, engine.size)
+    assert whole == engine.score
+
+
+def test_windows_partition_the_game():
+    engine = run_game(seed=33)
+    cuts = [0, 700, 1440, 2100, engine.size]
+    totals = {engine.home: 0, engine.away: 0}
+    for lo, hi in zip(cuts, cuts[1:]):
+        w = engine.window_score(lo, hi)
+        totals[engine.home] += w[engine.home]
+        totals[engine.away] += w[engine.away]
+    assert totals == engine.score
+
+
+def test_best_run_never_exceeds_window_points():
+    engine = run_game(seed=35)
+    for lo, hi in [(0, 720), (720, 1440), (1080, 1440), (0, engine.size)]:
+        window = engine.window_score(lo, hi)
+        for team in (engine.home, engine.away):
+            run = engine.best_run(team, lo, hi)
+            assert run.points <= window[team]
+            if run.points:
+                assert lo <= run.start < run.end <= hi
+
+
+def test_best_run_matches_a_direct_window_query():
+    engine = run_game(seed=37)
+    run = engine.best_run()
+    if run.points:
+        window = engine.window_score(run.start, run.end)
+        assert window[run.team] - window[engine.opponent(run.team)] == run.points
+
+
+def test_narrower_window_never_finds_a_bigger_run():
+    engine = run_game(seed=39)
+    wide = engine.best_run(engine.home, 0, 1440).points
+    narrow = engine.best_run(engine.home, 300, 1000).points
+    assert narrow <= wide
+
+
+def test_possessions_alternate_sensibly():
+    engine = run_game(seed=41)
+    assert engine.fsm.count > 50
+    home = engine.fsm.count_for(engine.home)
+    away = engine.fsm.count_for(engine.away)
+    assert abs(home - away) <= 12  # pace is shared, counts stay close
+
+
+def test_engine_rejects_events_after_finish():
+    engine = Engine()
+    events = generate(seed=43)
+    engine.process_all(events)
+    engine.finish()
+    with pytest.raises(RuntimeError):
+        engine.process(events[0])
+
+
+def test_finish_is_idempotent():
+    engine = run_game(seed=45)
+    assert engine.finish() == []
+
+
+def test_listeners_fire_once_per_released_event():
+    engine = Engine()
+    seen = []
+    engine.on_update(lambda u: seen.append(u.event.key))
+    engine.process_all(generate(seed=47))
+    engine.finish()
+    assert seen == [e.key for e in engine.log]
+
+
+def test_clamped_windows_do_not_raise():
+    engine = run_game(seed=49)
+    assert engine.window_score(-500, 10) == engine.window_score(0, 10)
+    assert engine.window_score(0, engine.size * 2) == engine.score
+
+
+def test_minute_helpers_match_second_queries():
+    engine = run_game(seed=51)
+    assert engine.window_minutes(18, 24) == engine.window_score(1080, 1440)
+    assert engine.best_run_minutes(18, 24).points == engine.best_run(None, 1080, 1440).points
+
+
+# ---------- agent ----------
+
+
+def test_clock_label_counts_down_within_the_period():
+    assert clock_label(0) == "Q1 12:00"
+    assert clock_label(60) == "Q1 11:00"
+    assert clock_label(720) == "Q2 12:00"
+    assert clock_label(2879) == "Q4 0:01"
+
+
+def test_win_probability_is_symmetric_and_bounded():
+    total = 2880
+    assert win_probability(0, 1000, total) == pytest.approx(0.5)
+    up = win_probability(10, 1000, total)
+    down = win_probability(-10, 1000, total)
+    assert up + down == pytest.approx(1.0)
+    assert 0.0 < down < 0.5 < up < 1.0
+
+
+def test_same_lead_matters_more_late():
+    early = win_probability(6, 200, 2880)
+    late = win_probability(6, 2800, 2880)
+    assert late > early
+
+
+def test_trigger_fires_on_a_big_run():
+    engine = Engine()
+    updates = []
+    for at in (10, 40, 70, 100):
+        updates = engine.process(ev(at, EventType.MADE_3, "HOME", "Ash"))
+    engine.finish()
+    reason = check_noteworthy(engine, updates[-1])
+    assert reason is not None
+    assert "HOME" in reason
+
+
+def test_trigger_ignores_non_scoring_events():
+    engine = Engine()
+    engine.process(ev(0, EventType.JUMP_BALL, "HOME"))
+    updates = engine.process(ev(10, EventType.DEF_REBOUND, "AWAY", "Ito"))
+    engine.finish()
+    assert all(check_noteworthy(engine, u) is None for u in updates)
+
+
+def test_tools_return_engine_numbers():
+    engine = run_game(seed=53)
+    assert get_score(engine)["score"] == engine.score
+    top = engine.top_scorers(limit=1)[0]
+    assert get_player_stats(engine, top.name)["points"] == top.points
+    run = get_best_run(engine)
+    if run["points"]:
+        assert run["points"] == engine.best_run().points
+
+
+def test_get_best_run_respects_the_window():
+    engine = run_game(seed=55)
+    scoped = get_best_run(engine, start_minute=18, end_minute=24)
+    assert scoped["points"] == engine.best_run(None, 1080, 1440).points
+
+
+def test_unknown_player_returns_an_error_not_an_exception():
+    engine = run_game(seed=57)
+    assert "error" in get_player_stats(engine, "Nobody")
+
+
+def test_run_tool_dispatch_and_bad_input():
+    engine = run_game(seed=59)
+    assert run_tool(engine, "get_score", {})["score"] == engine.score
+    assert "error" in run_tool(engine, "not_a_tool", {})
+    assert "error" in run_tool(engine, "get_player_stats", {"wrong": 1})
+
+
+def test_commentator_writes_a_line_for_every_trigger():
+    engine, commentator = watched_game(61, home_edge=20)
+    assert commentator.lines
+    for line in commentator.lines:
+        assert line.text.endswith(".")
+        assert line.reason in line.text
+
+
+def test_commentary_cites_numbers_the_engine_can_reproduce():
+    engine, commentator = watched_game(62, home_edge=20)
+    final = engine.score
+    for line in commentator.lines:
+        # the score in a line must be one of the two teams' totals so far
+        assert str(final[engine.home]) or str(final[engine.away])
+        assert "on the clock" in line.text
+
+
+def test_commentary_lines_are_spaced_out():
+    engine, commentator = watched_game(63, home_edge=20)
+    times = [line.elapsed for line in commentator.lines]
+    assert times == sorted(times)
+    assert all(b - a >= 45 for a, b in zip(times, times[1:]))
+
+
+def test_transcript_is_formatted_and_ordered():
+    engine, commentator = watched_game(65, home_edge=20)
+    lines = commentator.transcript()
+    assert len(lines) == len(commentator.lines)
+    assert all(line.startswith("Q") for line in lines)
+
+
+def test_commentator_stays_quiet_in_a_dull_game():
+    engine = Engine()
+    commentator = Commentator(engine)
+    engine.on_update(commentator.observe)
+    engine.process(ev(0, EventType.JUMP_BALL, "HOME"))
+    engine.process(ev(10, EventType.MADE_2, "HOME", "Ash"))
+    engine.finish()
+    assert commentator.lines == []
+
+
+# ---------- cli ----------
+
+
+def test_cli_replay_runs(capsys):
+    assert cli_main(["replay", "--synthetic", "--seed", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "FINAL" in out
+    assert "biggest run" in out
+
+
+def test_cli_query_runs(capsys):
+    code = cli_main(
+        ["query", "--synthetic", "--seed", "3", "--start-minute", "18", "--end-minute", "24"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "window" in out
+    assert "best run" in out
+
+
+def test_cli_query_rejects_a_backwards_window(capsys):
+    code = cli_main(["query", "--synthetic", "--start-minute", "24", "--end-minute", "18"])
+    assert code == 1
+
+
+def test_cli_verbose_prints_events(capsys):
+    cli_main(["replay", "--synthetic", "--seed", "3", "--verbose"])
+    out = capsys.readouterr().out
+    assert out.count("\n") > 100

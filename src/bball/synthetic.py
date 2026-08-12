@@ -42,7 +42,6 @@ class GameSpec:
     periods: int = REGULATION_PERIODS
     home_edge: float = 0.0  # shifts home scoring odds, roughly points per 100
     jitter: int = 0  # if set, shuffle output within this window
-    lateness_seconds: int = 0  # if set, delay some events past their slot
 
 
 class SyntheticGame:
@@ -60,7 +59,9 @@ class SyntheticGame:
         self._seq += 1
         return self._seq - 1
 
-    def _event(self, etype: EventType, period: int, clock: int, team=None, player=None) -> Event:
+    def _event(
+        self, etype: EventType, period: int, clock: int, team=None, player=None
+    ) -> Event:
         clock = max(0, min(clock, period_length(period)))
         return Event(
             type=etype,
@@ -73,6 +74,9 @@ class SyntheticGame:
 
     def _player(self, team: str) -> str:
         return self.rng.choice(self.rosters[team])
+
+    def _other(self, team: str) -> str:
+        return self.spec.away if team == self.spec.home else self.spec.home
 
     def _outcome(self, team: str) -> EventType:
         """Weighted pick, nudged by home_edge."""
@@ -96,8 +100,8 @@ class SyntheticGame:
         for period in range(1, self.spec.periods + 1):
             length = period_length(period)
             out.append(self._event(EventType.PERIOD_START, period, length))
-            if period == 1:
-                out.append(self._event(EventType.JUMP_BALL, period, length, offense))
+            # every period needs an opener, period end kills possession
+            out.append(self._event(EventType.JUMP_BALL, period, length, offense))
 
             clock = length
             while clock > MIN_POSSESSION:
@@ -112,10 +116,9 @@ class SyntheticGame:
 
         return self._maybe_disorder(out)
 
-    def _other(self, team: str) -> str:
-        return self.spec.away if team == self.spec.home else self.spec.home
-
-    def _possession(self, period: int, clock: int, offense: str) -> tuple[list[Event], str]:
+    def _possession(
+        self, period: int, clock: int, offense: str
+    ) -> tuple[list[Event], str]:
         """Emit one trip. Returns the events and who has the ball next."""
         defense = self._other(offense)
         shooter = self._player(offense)
@@ -126,7 +129,9 @@ class SyntheticGame:
             out.append(self._event(EventType.TURNOVER, period, clock, offense, shooter))
             if self.rng.random() < STEAL_RATE:
                 out.append(
-                    self._event(EventType.STEAL, period, clock, defense, self._player(defense))
+                    self._event(
+                        EventType.STEAL, period, clock, defense, self._player(defense)
+                    )
                 )
             return out, defense
 
@@ -134,7 +139,13 @@ class SyntheticGame:
             out.append(
                 self._event(EventType.FOUL, period, clock, defense, self._player(defense))
             )
-            return out + self._free_throws(period, clock, offense, shooter, 2), defense
+            shots, made_last = self._free_throws(period, clock, offense, shooter, 2)
+            out.extend(shots)
+            if made_last:
+                return out, defense
+            # a missed last free throw is a live ball, same as any other miss
+            reb, nxt = self._rebound(period, max(0, clock - 2), offense, defense)
+            return out + reb, nxt
 
         made = outcome in (EventType.MADE_2, EventType.MADE_3)
         if made:
@@ -142,7 +153,9 @@ class SyntheticGame:
             if self.rng.random() < ASSIST_RATE:
                 passer = self._player(offense)
                 if passer != shooter:
-                    out.append(self._event(EventType.ASSIST, period, clock, offense, passer))
+                    out.append(
+                        self._event(EventType.ASSIST, period, clock, offense, passer)
+                    )
             out.append(self._event(outcome, period, clock, offense, shooter))
             return out, defense
 
@@ -151,30 +164,37 @@ class SyntheticGame:
             out.append(
                 self._event(EventType.BLOCK, period, clock, defense, self._player(defense))
             )
+        reb, nxt = self._rebound(period, max(0, clock - 1), offense, defense)
+        return out + reb, nxt
 
-        # somebody has to rebound a miss
+    def _rebound(
+        self, period: int, clock: int, offense: str, defense: str
+    ) -> tuple[list[Event], str]:
+        """Somebody has to claim a miss."""
         if self.rng.random() < OFF_REBOUND_RATE:
-            out.append(
+            return [
                 self._event(
-                    EventType.OFF_REBOUND, period, max(0, clock - 1), offense, self._player(offense)
+                    EventType.OFF_REBOUND, period, clock, offense, self._player(offense)
                 )
-            )
-            return out, offense
-        out.append(
+            ], offense
+        return [
             self._event(
-                EventType.DEF_REBOUND, period, max(0, clock - 1), defense, self._player(defense)
+                EventType.DEF_REBOUND, period, clock, defense, self._player(defense)
             )
-        )
-        return out, defense
+        ], defense
 
-    def _free_throws(self, period: int, clock: int, team: str, shooter: str, count: int) -> list[Event]:
+    def _free_throws(
+        self, period: int, clock: int, team: str, shooter: str, count: int
+    ) -> tuple[list[Event], bool]:
+        """Returns the shots and whether the last one went in."""
         out: list[Event] = []
+        made = False
         for i in range(count):
             at = max(0, clock - i)
             made = self.rng.random() < FT_MAKE_RATE
             etype = EventType.MADE_FT if made else EventType.MISS_FT
             out.append(self._event(etype, period, at, team, shooter))
-        return out
+        return out, made
 
     # ---------- feed simulation ----------
 

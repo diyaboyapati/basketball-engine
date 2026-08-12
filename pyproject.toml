@@ -11,7 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
-agent = ["anthropic>=0.40"]
+
 
 [project.scripts]
 bball = "bball.cli:main"

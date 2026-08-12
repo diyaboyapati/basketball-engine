@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .agent import Commentator
 from .engine import Engine
 from .events import Event, period_length, period_start_elapsed
 from .synthetic import generate
@@ -16,10 +17,8 @@ def fmt_clock(event: Event) -> str:
 def fmt_second(elapsed: int) -> str:
     """Absolute second to period clock, for run windows."""
     period = 1
-    while elapsed >= period_start_elapsed(period) + period_length(period):
+    while elapsed >= period_start_elapsed(period) + period_length(period) and period < 8:
         period += 1
-        if period > 8:
-            break
     into = elapsed - period_start_elapsed(period)
     remaining = max(0, period_length(period) - into)
     return f"Q{period} {remaining // 60}:{remaining % 60:02d}"
@@ -47,7 +46,10 @@ def print_box(engine: Engine) -> None:
     print(f"  {box['period']} periods, {box['possessions']} possessions")
     print()
 
-    head = f"  {'':10} {'PTS':>4} {'FG':>7} {'3PT':>7} {'FT':>6} {'REB':>4} {'AST':>4} {'TOV':>4}"
+    head = (
+        f"  {'':10} {'PTS':>4} {'FG':>7} {'3PT':>7} "
+        f"{'FT':>6} {'REB':>4} {'AST':>4} {'TOV':>4}"
+    )
     for team in (home, away):
         print(f"  {team}")
         print(head)
@@ -78,13 +80,8 @@ def cmd_replay(args) -> int:
 
     commentator = None
     if not args.no_agent:
-        try:
-            from .agent import Commentator
-
-            commentator = Commentator(engine, offline=args.offline)
-            engine.on_update(commentator.observe)
-        except ImportError:
-            pass
+        commentator = Commentator(engine)
+        engine.on_update(commentator.observe)
 
     events = generate(
         seed=args.seed,
@@ -127,10 +124,14 @@ def cmd_query(args) -> int:
     window = engine.window_score(start, end)
     home, away = engine.home, engine.away
     print()
-    print(f"  window  minute {args.start_minute:g} to {args.end_minute:g}  "
-          f"({fmt_second(start)} to {fmt_second(max(start, end - 1))})")
-    print(f"  points  {home} {window[home]}  -  {away} {window[away]}   "
-          f"margin {engine.margin(start, end):+d}")
+    print(
+        f"  window  minute {args.start_minute:g} to {args.end_minute:g}  "
+        f"({fmt_second(start)} to {fmt_second(max(start, end - 1))})"
+    )
+    print(
+        f"  points  {home} {window[home]}  -  {away} {window[away]}   "
+        f"margin {engine.margin(start, end):+d}"
+    )
 
     for team in (home, away):
         run = engine.best_run(team, start, end)
@@ -148,7 +149,9 @@ def cmd_query(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="bball", description="basketball play-by-play engine")
+    parser = argparse.ArgumentParser(
+        prog="bball", description="basketball play-by-play engine"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p):
@@ -164,7 +167,6 @@ def build_parser() -> argparse.ArgumentParser:
     common(replay)
     replay.add_argument("--verbose", action="store_true", help="print every event")
     replay.add_argument("--no-agent", action="store_true")
-    replay.add_argument("--offline", action="store_true", help="agent uses templates only")
     replay.set_defaults(func=cmd_replay)
 
     query = sub.add_parser("query", help="range query over a window of the game")
